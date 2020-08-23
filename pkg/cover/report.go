@@ -6,6 +6,7 @@ package cover
 import (
 	"bufio"
 	"bytes"
+	"encoding/csv"
 	"fmt"
 	"html"
 	"html/template"
@@ -41,6 +42,13 @@ type symbol struct {
 	end   uint64
 }
 
+var CSVHeader = []string{
+	"Filename",
+	"Function",
+	"Percent",
+	"PCs",
+}
+
 func MakeReportGenerator(target *targets.Target, kernelObject, srcDir, buildDir string) (*ReportGenerator, error) {
 	rg := &ReportGenerator{
 		target:   target,
@@ -70,10 +78,16 @@ func MakeReportGenerator(target *targets.Target, kernelObject, srcDir, buildDir 
 
 type file struct {
 	lines       map[int]line
+	functions   map[string]*function
 	totalPCs    map[uint64]bool
 	coverPCs    map[uint64]bool
 	totalInline map[int]bool
 	coverInline map[int]bool
+}
+
+type function struct {
+	totalPCs map[uint64]bool
+	coverPCs map[uint64]bool
 }
 
 type line struct {
@@ -83,7 +97,7 @@ type line struct {
 	symbolCovered bool
 }
 
-func (rg *ReportGenerator) Do(w io.Writer, progs []Prog) error {
+func (rg *ReportGenerator) Do(htmlBuf, csvBuf io.Writer, progs []Prog) error {
 	coveredPCs := make(map[uint64]bool)
 	allPCs := make(map[uint64]bool)
 	symbols := make(map[uint64]bool)
@@ -133,6 +147,8 @@ func (rg *ReportGenerator) Do(w io.Writer, progs []Prog) error {
 					f.coverPCs[pc] = true
 				}
 			}
+			function := getFunction(f.functions, frame.Func)
+			function.totalPCs[pc] = true
 			if !covered {
 				ln := f.lines[frame.Line]
 				if !frame.Inline || len(ln.count) == 0 {
@@ -140,10 +156,19 @@ func (rg *ReportGenerator) Do(w io.Writer, progs []Prog) error {
 					ln.symbolCovered = symbols[rg.findSymbol(pc)]
 					f.lines[frame.Line] = ln
 				}
+			} else {
+				function.coverPCs[pc] = true
 			}
 		}
 	}
-	return rg.generate(w, progs, files)
+
+	if csvBuf != nil {
+		err := rg.generateCSV(csvBuf, progs, files)
+		if err != nil {
+			return err
+		}
+	}
+	return rg.generateHTML(htmlBuf, progs, files)
 }
 
 func getFile(files map[string]*file, name string) *file {
@@ -151,6 +176,7 @@ func getFile(files map[string]*file, name string) *file {
 	if f == nil {
 		f = &file{
 			lines:       make(map[int]line),
+			functions:   make(map[string]*function),
 			totalPCs:    make(map[uint64]bool),
 			coverPCs:    make(map[uint64]bool),
 			totalInline: make(map[int]bool),
@@ -161,7 +187,44 @@ func getFile(files map[string]*file, name string) *file {
 	return f
 }
 
-func (rg *ReportGenerator) generate(w io.Writer, progs []Prog, files map[string]*file) error {
+func getFunction(functions map[string]*function, name string) *function {
+	f := functions[name]
+	if f == nil {
+		f = &function{
+			totalPCs: make(map[uint64]bool),
+			coverPCs: make(map[uint64]bool),
+		}
+		functions[name] = f
+	}
+	return f
+}
+
+func (rg *ReportGenerator) generateCSV(w io.Writer, progs []Prog, files map[string]*file) error {
+	data := [][]string{
+		CSVHeader,
+	}
+
+	for fname, file := range files {
+		for funcName, function := range file.functions {
+			line := []string{fname, funcName,
+				strconv.Itoa(percent(len(function.coverPCs),
+					len(function.totalPCs))),
+				strconv.Itoa(len(function.totalPCs))}
+			data = append(data, line)
+		}
+	}
+	writer := csv.NewWriter(w)
+	defer writer.Flush()
+
+	err := writer.WriteAll(data)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (rg *ReportGenerator) generateHTML(w io.Writer, progs []Prog, files map[string]*file) error {
 	d := &templateData{
 		Root: new(templateDir),
 	}
@@ -259,12 +322,34 @@ func (rg *ReportGenerator) generate(w io.Writer, progs []Prog, files map[string]
 		}
 		d.Contents = append(d.Contents, template.HTML(buf.String()))
 		f.Index = len(d.Contents) - 1
+
+		addFunctionCoverage(file, d)
 	}
 	for _, prog := range progs {
 		d.Progs = append(d.Progs, template.HTML(html.EscapeString(prog.Data)))
 	}
+
 	processDir(d.Root)
 	return coverTemplate.Execute(w, d)
+}
+
+func addFunctionCoverage(file *file, data *templateData) {
+	var buf bytes.Buffer
+	for functionName, function := range file.functions {
+		var percentage string
+		if len(function.coverPCs) > 0 {
+			percentage = fmt.Sprintf("%d%%", percent(len(function.coverPCs), len(function.totalPCs)))
+		} else {
+			percentage = "---"
+		}
+		buf.WriteString(fmt.Sprintf("<span class='hover'>%v", functionName))
+		buf.WriteString(fmt.Sprintf("<span class='cover hover'>%v", percentage))
+		buf.WriteString(fmt.Sprintf("<span class='cover-right'>of %v", strconv.Itoa(len(function.totalPCs))))
+		buf.WriteString("</span></span></span><br>\n")
+	}
+	if buf.Len() > 0 {
+		data.Functions = append(data.Functions, template.HTML(buf.String()))
+	}
 }
 
 func processDir(dir *templateDir) {
@@ -540,9 +625,10 @@ func archCallInsn(target *targets.Target) ([][]byte, [][]byte) {
 }
 
 type templateData struct {
-	Root     *templateDir
-	Contents []template.HTML
-	Progs    []template.HTML
+	Root      *templateDir
+	Contents  []template.HTML
+	Progs     []template.HTML
+	Functions []template.HTML
 }
 
 type templateBase struct {
@@ -591,6 +677,18 @@ var coverTemplate = template.Must(template.New("").Parse(`
 			.tree {
 				left: 0;
 				width: 24%;
+			}
+			.function {
+				height: 100%;
+				position: fixed;
+				z-index: 1;
+				top: 0;
+				overflow-x: hidden;
+				display: none;
+			}
+			.list {
+				left: 24%;
+				width: 30%;
 			}
 			.right {
 				border-left: 2px solid #444;
@@ -667,6 +765,9 @@ var coverTemplate = template.Must(template.New("").Parse(`
 			{{range $i, $p := .Progs}}
 				<pre class="file" id="prog_{{$i}}">{{$p}}</pre>
 			{{end}}
+                        {{range $i, $p := .Functions}}
+				<div class="function list" id="function_{{$i}}">{{$p}}</div>
+			{{end}}
 		</div>
 	</body>
 	<script>
@@ -690,6 +791,13 @@ var coverTemplate = template.Must(template.New("").Parse(`
 		}
 	})();
 	var visible;
+        function onPercentageClick(index) {
+		if (visible)
+			visible.style.display = 'none';
+		visible = document.getElementById("function_" + index);
+		visible.style.display = 'block';
+		document.getElementById("right_pane").scrollTo(0, 0);
+	}
 	function onFileClick(index) {
 		if (visible)
 			visible.style.display = 'none';
@@ -726,11 +834,11 @@ var coverTemplate = template.Must(template.New("").Parse(`
 		<li><span class="hover">
 			{{if $file.Covered}}
 				<a href="#{{$file.Path}}" id="path/{{$file.Path}}" onclick="onFileClick({{$file.Index}})">
-					{{$file.Name}}<span class="cover hover">
-						{{$file.Percent}}%
+					{{$file.Name}}</a><span class="cover hover">
+						<a href="#{{$file.Percent}}%" id="path/{{$file.Path}}" onclick="onPercentageClick({{$file.Index}})">
+                                                {{$file.Percent}}%</a>
 						<span class="cover-right">of {{$file.Total}}</span>
 					</span>
-				</a>
 			{{else}}
 					{{$file.Name}}<span class="cover hover">---<span class="cover-right">
 						of {{$file.Total}}</span></span>
