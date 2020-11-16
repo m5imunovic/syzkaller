@@ -89,6 +89,42 @@ func (ctx *serializer) arg(arg Arg) {
 	arg.serialize(ctx)
 }
 
+// SerializeArgVals outputs comma-separated argument values of the syscall.
+func (p *Prog) SerializeArgRet(verbose bool) ([]string, []string) {
+	ctx := &serializer{
+		target:  p.Target,
+		buf:     new(bytes.Buffer),
+		vars:    make(map[*ResultArg]int),
+		verbose: verbose,
+	}
+
+	var argVal []string
+	var retVal []string
+	for _, c := range p.Calls {
+
+		if c.Ret != nil && len(c.Ret.uses) != 0 {
+			ctx.printf("r%v", ctx.allocVarID(c.Ret))
+			retVal = append(retVal, ctx.buf.String())
+			ctx.buf.Reset()
+		} else {
+			retVal = append(retVal, "nil")
+		}
+
+		for i, a := range c.Args {
+			if IsPad(a.Type()) {
+				continue
+			}
+			if i != 0 {
+				ctx.printf(",")
+			}
+			ctx.arg(a)
+		}
+		argVal = append(argVal, ctx.buf.String())
+		ctx.buf.Reset()
+	}
+	return argVal, retVal
+}
+
 func (a *ConstArg) serialize(ctx *serializer) {
 	ctx.printf("0x%x", a.Val)
 }
